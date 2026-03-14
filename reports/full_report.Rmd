@@ -307,161 +307,23 @@ ts_results$acc_table %>%
 
 # Bayesian Hierarchical Model
 
-```{r load-bayes}
-bayes_results <- readRDS("../data/bayes_results.rds")
+```{r load-bayes, echo=FALSE}
+cat('Bayesian module skipped')
 ```
 
-## Motivation: Why Bayesian?
+> **Note:** Bayesian module skipped.
 
-The frequentist Negative Binomial GLM provides **point estimates** and 
-**confidence intervals** based on asymptotic approximations. The Bayesian 
-approach instead provides the **full posterior distribution** of each parameter.
-
-This means we can make direct probabilistic statements:
-
-> *"Given the data and our prior knowledge, there is a 94% probability that PM2.5 
-> exposure increases same-day respiratory admissions."*
-
-## Prior Specification
-
-| Parameter | Prior | Rationale |
-|---|---|---|
-| PM2.5 effect (log RR) | Normal(0, 0.05) | Small positive effect expected |
-| Intercept (log scale) | Normal(3, 0.5) | ~20 admissions/day at baseline |
-| NB shape (θ) | Half-Cauchy(0, 2.5) | Regularises overdispersion |
-
-## MCMC Convergence
-
-```{r convergence}
-bayes_results$rhat_df %>%
-  filter(str_detect(parameter, "pm|temp|Intercept|shape")) %>%
-  mutate(converged = rhat < 1.01) %>%
-  kable(caption = "R-hat convergence diagnostics (< 1.01 = converged)",
-        digits = 4) %>%
-  kable_styling(bootstrap_options = c("striped"), full_width = FALSE) %>%
-  column_spec(3, color = ifelse(bayes_results$rhat_df %>% 
-    filter(str_detect(parameter, "pm|temp|Intercept|shape")) %>% 
-    pull(rhat) < 1.01, "green", "red"))
-```
-
-## Posterior Distributions
-
-```{r posterior-plot, fig.cap="Posterior distributions of Rate Ratios. Values to the right of 1 indicate increased admissions risk."}
-bayes_results$cred_intervals %>%
-  filter(str_detect(parameter, "PM2.5|Temp")) %>%
-  ggplot(aes(y = reorder(parameter, median_rr))) +
-  geom_vline(xintercept = 1, colour = "gray50", linetype = "dashed") +
-  geom_errorbarh(aes(xmin = lower_95, xmax = upper_95), height = 0,
-                 linewidth = 2, colour = "#5B8DBE", alpha = 0.4) +
-  geom_errorbarh(aes(xmin = lower_80, xmax = upper_80), height = 0,
-                 linewidth = 3.5, colour = "#5B8DBE", alpha = 0.7) +
-  geom_point(aes(x = median_rr), size = 4, colour = "#FF7043") +
-  geom_text(aes(x = upper_95 + 0.002,
-                label = paste0("P(harm)=", round(prob_gt_1*100,1),"%")),
-            hjust = 0, size = 3.5, colour = "gray40") +
-  labs(
-    title    = "Bayesian Rate Ratios — Posterior Medians and Credible Intervals",
-    subtitle = "Thick bar = 80% CI; thin bar = 95% CI; dot = posterior median",
-    x = "Rate Ratio", y = NULL
-  ) +
-  theme_minimal(base_size = 12) +
-  xlim(NA, max(bayes_results$cred_intervals$upper_95) + 0.02)
-```
-
----
-
-# Causal Inference: ULEZ Analysis
-
-```{r load-causal}
-causal_results <- readRDS("../data/causal_results.rds")
-```
-
-## Design: Interrupted Time Series
-
-**The challenge**: Pollution was already declining before the ULEZ expansion (2021). 
-A naive before/after comparison would overestimate the ULEZ effect.
-
-**The solution**: Interrupted Time Series (ITS) models the **pre-existing trend** 
-separately from the **intervention effect**, estimating:
-
-1. **Level change**: Immediate step up/down at the intervention date
-2. **Slope change**: Change in the rate of decline
-
-## ITS Visualisation
-
-```{r its-plot, fig.cap="ITS analysis: observed vs counterfactual PM2.5 at KC1."}
-its_data <- causal_results$its_plot_data
-
-ggplot(its_data) +
-  geom_point(aes(x = date, y = pm2.5), alpha = 0.12, size = 0.6, colour = "gray40") +
-  geom_line(aes(x = date, y = fitted), colour = "#5B8DBE", linewidth = 1) +
-  geom_line(aes(x = date, y = counterfactual),
-            colour = "#FF7043", linewidth = 1, linetype = "dashed") +
-  geom_vline(xintercept = as.Date("2021-10-25"), colour = "red", linewidth = 1) +
-  annotate("text", x = as.Date("2021-11-10"), y = 42,
-           label = "ULEZ", colour = "red", size = 3.5) +
-  annotate("text", x = as.Date("2022-06-01"), y = 28,
-           label = "Counterfactual\n(no ULEZ)", colour = "#FF7043", size = 3.5) +
-  labs(title = "ITS: Observed vs Counterfactual PM2.5 (KC1)",
-       subtitle = "Blue = fitted model; Orange dashed = predicted without ULEZ intervention",
-       x = NULL, y = "PM2.5 (µg/m³)") +
-  theme_minimal(base_size = 12)
-```
-
-## Causal Estimates
-
-```{r causal-summary}
-causal_results$causal_summary %>%
-  kable(caption = "Summary of causal effect estimates") %>%
-  kable_styling(bootstrap_options = c("striped","hover"))
-```
-
----
-
-# Machine Learning Comparison
-
-```{r load-ml}
-ml_results <- readRDS("../data/ml_results.rds")
+```{r load-ml, echo=FALSE}
+ml_results <- readRDS('../data/ml_results.rds')
 ```
 
 ## Model Comparison
 
-```{r ml-comparison-table}
-ml_results$comparison_table %>%
-  kable(caption = "All models compared on 90-day test set (lower RMSE = better)",
-        digits = 3) %>%
-  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) %>%
-  row_spec(1, bold = TRUE, background = "#e8f4f8")
+```{r ml-table, echo=FALSE}
+knitr::kable(ml_results$comparison_table,
+  caption = 'All models compared on 90-day test set',
+  digits = 3)
 ```
-
-## Variable Importance (Random Forest)
-
-```{r rf-importance, fig.cap="Top 15 most important features for next-day PM2.5 prediction (Random Forest)."}
-ml_results$rf_importance %>%
-  ggplot(aes(x = importance, y = reorder(variable, importance))) +
-  geom_col(fill = "#5B8DBE", alpha = 0.85) +
-  labs(title = "Random Forest: Variable Importance",
-       subtitle = "Recent lag features dominate — PM2.5 has strong autocorrelation",
-       x = "Importance", y = NULL) +
-  theme_minimal(base_size = 12)
-```
-
-## Key Insight: Statistical vs ML
-
-ML models excel at:
-
-- Capturing **non-linear** relationships (e.g., threshold effects)
-- Using **many features** simultaneously without manual selection
-- **Interaction effects** (e.g., pollution × temperature)
-
-Statistical models (ARIMA, GLM) excel at:
-
-- **Interpretability** — each coefficient has a clear meaning
-- **Uncertainty quantification** — principled confidence/credible intervals
-- **Extrapolation** — can reason outside training data range
-- **Small samples** — ML typically needs more data
-
----
 
 # Conclusions
 
