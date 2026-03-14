@@ -105,4 +105,4 @@ rsconnect::deployApp("shiny/")
 
 ## 👤 Author
 
-Built as a portfolio project for MSc Statistics with Data Science (University of Edinburgh) application.
+Built as a portfolio project.
