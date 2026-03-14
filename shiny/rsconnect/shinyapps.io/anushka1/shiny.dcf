@@ -1,0 +1,10 @@
+name: shiny
+title:
+username: anushka1
+account: anushka1
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 16896630
+bundleId: 11706110
+url: https://anushka1.shinyapps.io/shiny/
+version: 1

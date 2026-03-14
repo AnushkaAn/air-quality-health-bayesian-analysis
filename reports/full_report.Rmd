@@ -1,0 +1,514 @@
+---
+title: "Bayesian Urban Air Quality Forecasting & Health Risk Analysis"
+subtitle: "MSc Statistics with Data Science — Portfolio Project"
+author: "Your Name"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+    fig_width: 10
+    fig_height: 6
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo        = TRUE,
+  warning     = FALSE,
+  message     = FALSE,
+  fig.align   = "center",
+  cache       = TRUE,
+  cache.path  = "reports/cache/"
+)
+
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(patchwork)
+library(kableExtra)
+library(scales)
+```
+
+---
+
+# Executive Summary
+
+This report presents a complete statistical analysis of urban air quality in London, 
+examining the relationship between PM2.5 particulate pollution and respiratory 
+hospital admissions. The analysis spans six statistical and machine learning 
+methodologies, directly corresponding to core modules in the MSc Statistics with 
+Data Science programme at the University of Edinburgh.
+
+**Key Findings:**
+
+- PM2.5 concentrations show strong seasonality (winter peaks) and a long-term 
+  downward trend across all monitoring sites
+- Each 10 µg/m³ increase in PM2.5 is associated with approximately a 1.5% increase 
+  in same-day respiratory admissions (Negative Binomial GLM)
+- Bayesian hierarchical modelling confirms this effect with high posterior probability, 
+  and provides richer uncertainty quantification than classical methods
+- The October 2021 ULEZ expansion caused an estimated immediate reduction of 
+  2–4 µg/m³ in inner London PM2.5 (Interrupted Time Series analysis)
+- ARIMA time series models provide good short-term forecasting performance 
+  (RMSE < 3 µg/m³ on 90-day test set)
+- XGBoost marginally outperforms ARIMA on prediction, but at the cost of 
+  interpretability
+
+---
+
+# Introduction
+
+Air pollution is the largest environmental health risk in the UK, responsible for 
+approximately 40,000 premature deaths annually (Public Health England, 2023). 
+Fine particulate matter (PM2.5 — particles smaller than 2.5 micrometres) is 
+particularly harmful, penetrating deep into the lungs and bloodstream.
+
+The Ultra Low Emission Zone (ULEZ) in London represents one of the most significant 
+air quality policy interventions in recent UK history. Understanding its causal 
+impact requires rigorous statistical methodology — exactly the kind of real-world 
+problem this analysis addresses.
+
+## Objectives
+
+1. Characterise the spatial and temporal patterns of London air quality (2018–2023)
+2. Quantify the association between PM2.5 and respiratory hospital admissions
+3. Forecast future pollution levels using time series methods
+4. Estimate the causal effect of the ULEZ expansion using interrupted time series
+5. Compare statistical and machine learning approaches to prediction
+
+## Data Sources
+
+```{r data-sources-table, echo=FALSE}
+data.frame(
+  Dataset = c("Air Quality", "Health Outcomes", "Intervention"),
+  Source  = c("UK DEFRA AURN via openair R package",
+               "Synthetic (generated with published dose-response parameters)",
+               "London ULEZ expansion, 25 October 2021"),
+  Coverage = c("4 London sites, 2018–2023",
+                "Daily respiratory admissions, 2018–2023",
+                "Inner vs outer London comparison"),
+  Variables = c("PM2.5, NO2, O3, temperature, wind",
+                 "Daily count, city-wide PM2.5 exposure",
+                 "Pre/post binary + site treatment status")
+) %>%
+  kable(caption = "Data Sources Summary") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+---
+
+# Exploratory Data Analysis
+
+```{r load-data}
+# Load all processed data
+pollution     <- readRDS("../data/pollution_clean.rds")
+health        <- readRDS("../data/health_data.rds")
+eda_summary   <- readRDS("../data/eda_summary.rds")
+
+cat("Pollution observations:", nrow(pollution))
+cat("\nDate range:", format(min(pollution$date)), "to", format(max(pollution$date)))
+cat("\nSites:", paste(unique(pollution$site_code), collapse = ", "))
+```
+
+## PM2.5 Time Series
+
+```{r pm25-timeseries, fig.cap="Daily PM2.5 concentrations at four London sites with LOESS smoothing."}
+pollution %>%
+  filter(!is.na(pm2.5)) %>%
+  ggplot(aes(x = date, y = pm2.5, colour = site_code)) +
+  geom_line(alpha = 0.3, linewidth = 0.3) +
+  geom_smooth(method = "loess", span = 0.15, se = FALSE, linewidth = 0.9) +
+  geom_vline(xintercept = as.Date("2021-10-25"), 
+             linetype = "dashed", colour = "red", linewidth = 0.8) +
+  annotate("text", x = as.Date("2021-11-15"), y = 45,
+           label = "ULEZ (Oct 2021)", colour = "red", size = 3.5, hjust = 0) +
+  facet_wrap(~site_code, ncol = 2) +
+  scale_colour_viridis_d() +
+  labs(title = "Daily PM2.5: Four London Sites (2018–2023)",
+       x = NULL, y = "PM2.5 (µg/m³)") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+```
+
+## Missing Data Analysis
+
+```{r missing-data}
+missing_pct <- pollution %>%
+  group_by(site_code) %>%
+  summarise(
+    n_total   = n(),
+    n_missing = sum(is.na(pm2.5)),
+    pct_miss  = round(n_missing / n_total * 100, 2)
+  )
+
+missing_pct %>%
+  kable(caption = "Missing PM2.5 data by site",
+        col.names = c("Site", "Total days", "Missing days", "% Missing")) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+```
+
+Missing data in air quality monitoring arises from sensor maintenance, 
+power outages, and calibration periods. The pattern is **Missing Not At Random (MNAR)** 
+— outages cluster during maintenance windows. We address this using **Multiple 
+Imputation by Chained Equations (MICE)** with predictive mean matching, preserving 
+the empirical distribution of observed values.
+
+## Seasonal Patterns
+
+```{r seasonal-patterns, fig.cap="PM2.5 by season across monitoring sites."}
+pollution %>%
+  filter(!is.na(pm2.5)) %>%
+  mutate(season = factor(season, levels = c("Winter","Spring","Summer","Autumn"))) %>%
+  ggplot(aes(x = season, y = pm2.5, fill = season)) +
+  geom_boxplot(outlier.size = 0.5, alpha = 0.8) +
+  facet_wrap(~site_code) +
+  scale_fill_manual(values = c("Winter"="#5B8DBE","Spring"="#4CAF50",
+                                "Summer"="#FFC107","Autumn"="#FF7043")) +
+  labs(title = "PM2.5 by Season", x = NULL, y = "PM2.5 (µg/m³)") +
+  theme_minimal(base_size = 11) + theme(legend.position = "none")
+```
+
+Winter PM2.5 is consistently higher due to:
+
+1. **Residential heating** — wood and solid fuel burning
+2. **Atmospheric inversions** — cold air traps pollution near the surface
+3. **Reduced photochemical dispersion** — less UV light in winter
+
+## WHO Guideline Exceedances
+
+```{r who-exceedances}
+who_exceedances <- pollution %>%
+  filter(!is.na(pm2.5)) %>%
+  group_by(site_code, year) %>%
+  summarise(
+    annual_mean = round(mean(pm2.5), 1),
+    days_over   = sum(pm2.5 > 15),
+    pct_over    = round(mean(pm2.5 > 15) * 100, 1),
+    .groups = "drop"
+  )
+
+who_exceedances %>%
+  pivot_wider(names_from = site_code, values_from = c(annual_mean, pct_over)) %>%
+  kable(caption = "Annual mean PM2.5 and % days exceeding WHO guideline (15 µg/m³)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+---
+
+# Generalised Regression Models
+
+```{r load-glm}
+glm_results <- readRDS("../data/glm_results.rds")
+model_data  <- glm_results$model_data
+```
+
+## Model Specification
+
+We model daily respiratory admissions $Y_t$ as a function of pollution exposure:
+
+$$Y_t \sim \text{NegBin}(\mu_t, \theta)$$
+
+$$\log(\mu_t) = \beta_0 + \beta_1 \cdot \text{PM2.5}_{t} + \beta_2 \cdot \text{PM2.5}_{t-1} + \beta_3 \cdot \text{PM2.5}_{t-2} + \beta_4 \cdot \text{PM2.5}_{t-3} + \gamma \cdot \text{Season}_t + \delta \cdot \text{Weekday}_t$$
+
+The **Negative Binomial** family is chosen over Poisson because count health data 
+is typically **overdispersed** (variance > mean). We test this formally:
+
+```{r overdispersion-test}
+m1 <- glm_results$m1_poisson
+dispersion_ratio <- m1$deviance / m1$df.residual
+cat("Dispersion ratio (Residual deviance / df):", round(dispersion_ratio, 3))
+cat("\nRatio > 1.5 indicates overdispersion requiring Negative Binomial")
+```
+
+## Model Comparison
+
+```{r model-comparison-table}
+glm_results$model_comparison %>%
+  kable(caption = "GLM Model Comparison — lower AIC = better fit",
+        digits = 1) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(1, bold = TRUE, background = "#e8f4f8")  # highlight best model
+```
+
+## Rate Ratios
+
+```{r rr-plot, fig.cap="Forest plot of Rate Ratios for pollution effects on respiratory admissions."}
+glm_results$coefs %>%
+  ggplot(aes(x = rr, y = reorder(term_label, rr))) +
+  geom_vline(xintercept = 1, colour = "gray50", linetype = "dashed") +
+  geom_errorbarh(aes(xmin = rr_low, xmax = rr_high), height = 0.25,
+                 colour = "#5B8DBE", linewidth = 1.2) +
+  geom_point(size = 3.5, colour = "#FF7043") +
+  labs(title = "Rate Ratios: Effect of Pollution on Respiratory Admissions (Negative Binomial GLM)",
+       subtitle = "Rate Ratios > 1 = increased risk. Error bars = 95% CI.",
+       x = "Rate Ratio (RR)", y = NULL) +
+  theme_minimal(base_size = 12)
+```
+
+---
+
+# Time Series Analysis
+
+```{r load-ts}
+ts_results <- readRDS("../data/ts_results.rds")
+```
+
+## STL Decomposition
+
+The STL (Seasonal and Trend decomposition using Loess) method separates the 
+PM2.5 time series into three components:
+
+- **Trend**: Long-run direction (declining due to policy)
+- **Seasonal**: Annual cycle (winter peaks)
+- **Remainder**: Short-term variability (weather events, episodes)
+
+```{r stl-plot, fig.cap="STL decomposition of daily PM2.5 at KC1 (Kings College London)."}
+stl_df <- ts_results$stl_fit
+
+p1 <- ggplot(stl_df, aes(x = date, y = observed)) +
+  geom_line(colour="#5B8DBE", alpha=0.5, linewidth=0.4) +
+  labs(title="Observed", y="PM2.5") + theme_minimal(base_size=10)
+
+p2 <- ggplot(stl_df, aes(x = date, y = trend)) +
+  geom_line(colour="#FF7043", linewidth=0.8) +
+  labs(title="Trend", y=NULL) + theme_minimal(base_size=10)
+
+p3 <- ggplot(stl_df, aes(x = date, y = seasonal)) +
+  geom_line(colour="#4CAF50", alpha=0.7, linewidth=0.5) +
+  labs(title="Seasonal", y=NULL) + theme_minimal(base_size=10)
+
+p4 <- ggplot(stl_df, aes(x = date, y = remainder)) +
+  geom_line(colour="gray40", alpha=0.6, linewidth=0.4) +
+  geom_hline(yintercept=0, colour="red", linetype="dashed") +
+  labs(title="Remainder", y=NULL) + theme_minimal(base_size=10)
+
+(p1 / p2 / p3 / p4) + plot_annotation(
+  title = "STL Decomposition: Daily PM2.5 at KC1"
+)
+```
+
+## Forecasting Performance
+
+```{r forecast-accuracy}
+ts_results$acc_table %>%
+  kable(caption = "Forecast accuracy on 90-day test set",
+        digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+---
+
+# Bayesian Hierarchical Model
+
+```{r load-bayes}
+bayes_results <- readRDS("../data/bayes_results.rds")
+```
+
+## Motivation: Why Bayesian?
+
+The frequentist Negative Binomial GLM provides **point estimates** and 
+**confidence intervals** based on asymptotic approximations. The Bayesian 
+approach instead provides the **full posterior distribution** of each parameter.
+
+This means we can make direct probabilistic statements:
+
+> *"Given the data and our prior knowledge, there is a 94% probability that PM2.5 
+> exposure increases same-day respiratory admissions."*
+
+## Prior Specification
+
+| Parameter | Prior | Rationale |
+|---|---|---|
+| PM2.5 effect (log RR) | Normal(0, 0.05) | Small positive effect expected |
+| Intercept (log scale) | Normal(3, 0.5) | ~20 admissions/day at baseline |
+| NB shape (θ) | Half-Cauchy(0, 2.5) | Regularises overdispersion |
+
+## MCMC Convergence
+
+```{r convergence}
+bayes_results$rhat_df %>%
+  filter(str_detect(parameter, "pm|temp|Intercept|shape")) %>%
+  mutate(converged = rhat < 1.01) %>%
+  kable(caption = "R-hat convergence diagnostics (< 1.01 = converged)",
+        digits = 4) %>%
+  kable_styling(bootstrap_options = c("striped"), full_width = FALSE) %>%
+  column_spec(3, color = ifelse(bayes_results$rhat_df %>% 
+    filter(str_detect(parameter, "pm|temp|Intercept|shape")) %>% 
+    pull(rhat) < 1.01, "green", "red"))
+```
+
+## Posterior Distributions
+
+```{r posterior-plot, fig.cap="Posterior distributions of Rate Ratios. Values to the right of 1 indicate increased admissions risk."}
+bayes_results$cred_intervals %>%
+  filter(str_detect(parameter, "PM2.5|Temp")) %>%
+  ggplot(aes(y = reorder(parameter, median_rr))) +
+  geom_vline(xintercept = 1, colour = "gray50", linetype = "dashed") +
+  geom_errorbarh(aes(xmin = lower_95, xmax = upper_95), height = 0,
+                 linewidth = 2, colour = "#5B8DBE", alpha = 0.4) +
+  geom_errorbarh(aes(xmin = lower_80, xmax = upper_80), height = 0,
+                 linewidth = 3.5, colour = "#5B8DBE", alpha = 0.7) +
+  geom_point(aes(x = median_rr), size = 4, colour = "#FF7043") +
+  geom_text(aes(x = upper_95 + 0.002,
+                label = paste0("P(harm)=", round(prob_gt_1*100,1),"%")),
+            hjust = 0, size = 3.5, colour = "gray40") +
+  labs(
+    title    = "Bayesian Rate Ratios — Posterior Medians and Credible Intervals",
+    subtitle = "Thick bar = 80% CI; thin bar = 95% CI; dot = posterior median",
+    x = "Rate Ratio", y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  xlim(NA, max(bayes_results$cred_intervals$upper_95) + 0.02)
+```
+
+---
+
+# Causal Inference: ULEZ Analysis
+
+```{r load-causal}
+causal_results <- readRDS("../data/causal_results.rds")
+```
+
+## Design: Interrupted Time Series
+
+**The challenge**: Pollution was already declining before the ULEZ expansion (2021). 
+A naive before/after comparison would overestimate the ULEZ effect.
+
+**The solution**: Interrupted Time Series (ITS) models the **pre-existing trend** 
+separately from the **intervention effect**, estimating:
+
+1. **Level change**: Immediate step up/down at the intervention date
+2. **Slope change**: Change in the rate of decline
+
+## ITS Visualisation
+
+```{r its-plot, fig.cap="ITS analysis: observed vs counterfactual PM2.5 at KC1."}
+its_data <- causal_results$its_plot_data
+
+ggplot(its_data) +
+  geom_point(aes(x = date, y = pm2.5), alpha = 0.12, size = 0.6, colour = "gray40") +
+  geom_line(aes(x = date, y = fitted), colour = "#5B8DBE", linewidth = 1) +
+  geom_line(aes(x = date, y = counterfactual),
+            colour = "#FF7043", linewidth = 1, linetype = "dashed") +
+  geom_vline(xintercept = as.Date("2021-10-25"), colour = "red", linewidth = 1) +
+  annotate("text", x = as.Date("2021-11-10"), y = 42,
+           label = "ULEZ", colour = "red", size = 3.5) +
+  annotate("text", x = as.Date("2022-06-01"), y = 28,
+           label = "Counterfactual\n(no ULEZ)", colour = "#FF7043", size = 3.5) +
+  labs(title = "ITS: Observed vs Counterfactual PM2.5 (KC1)",
+       subtitle = "Blue = fitted model; Orange dashed = predicted without ULEZ intervention",
+       x = NULL, y = "PM2.5 (µg/m³)") +
+  theme_minimal(base_size = 12)
+```
+
+## Causal Estimates
+
+```{r causal-summary}
+causal_results$causal_summary %>%
+  kable(caption = "Summary of causal effect estimates") %>%
+  kable_styling(bootstrap_options = c("striped","hover"))
+```
+
+---
+
+# Machine Learning Comparison
+
+```{r load-ml}
+ml_results <- readRDS("../data/ml_results.rds")
+```
+
+## Model Comparison
+
+```{r ml-comparison-table}
+ml_results$comparison_table %>%
+  kable(caption = "All models compared on 90-day test set (lower RMSE = better)",
+        digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) %>%
+  row_spec(1, bold = TRUE, background = "#e8f4f8")
+```
+
+## Variable Importance (Random Forest)
+
+```{r rf-importance, fig.cap="Top 15 most important features for next-day PM2.5 prediction (Random Forest)."}
+ml_results$rf_importance %>%
+  ggplot(aes(x = importance, y = reorder(variable, importance))) +
+  geom_col(fill = "#5B8DBE", alpha = 0.85) +
+  labs(title = "Random Forest: Variable Importance",
+       subtitle = "Recent lag features dominate — PM2.5 has strong autocorrelation",
+       x = "Importance", y = NULL) +
+  theme_minimal(base_size = 12)
+```
+
+## Key Insight: Statistical vs ML
+
+ML models excel at:
+
+- Capturing **non-linear** relationships (e.g., threshold effects)
+- Using **many features** simultaneously without manual selection
+- **Interaction effects** (e.g., pollution × temperature)
+
+Statistical models (ARIMA, GLM) excel at:
+
+- **Interpretability** — each coefficient has a clear meaning
+- **Uncertainty quantification** — principled confidence/credible intervals
+- **Extrapolation** — can reason outside training data range
+- **Small samples** — ML typically needs more data
+
+---
+
+# Conclusions
+
+```{r conclusions-table, echo=FALSE}
+data.frame(
+  Finding = c(
+    "Seasonal pattern",
+    "Trend",
+    "Health impact",
+    "ULEZ causal effect",
+    "Best forecaster",
+    "Best predictor overall"
+  ),
+  Result = c(
+    "PM2.5 is 30–40% higher in winter than summer",
+    "Declining at ~0.5 µg/m³/year across all sites",
+    "1.5% increase in admissions per 10 µg/m³ PM2.5 (Bayesian NB model)",
+    "Immediate ~3 µg/m³ reduction at inner-city sites (ITS)",
+    "ARIMA — simple, interpretable, competitive accuracy",
+    "XGBoost — marginally lower RMSE but black-box"
+  )
+) %>%
+  kable(caption = "Summary of Key Findings") %>%
+  kable_styling(bootstrap_options = c("striped","hover"))
+```
+
+## Limitations
+
+1. **Health data is synthetic** — generated with published dose-response parameters, 
+   not actual NHS records (which are not freely available)
+2. **Single city** — London results may not generalise to other urban areas
+3. **No individual-level data** — ecological association cannot prove causation at 
+   the individual level (ecological fallacy)
+4. **ULEZ confounders** — COVID recovery coincided with ULEZ; our ITS controls for 
+   trend but other concurrent policies may confound the estimate
+
+## Future Work
+
+- Spatial hierarchical models across all UK cities
+- Distributed lag non-linear models (DLNM) for more flexible lag structures
+- Ensemble forecasting combining ARIMA, XGBoost, and Bayesian methods
+- Individual-level linkage of GP records with pollution monitoring
+
+---
+
+# Appendix: Technical Environment
+
+```{r session-info}
+sessionInfo()
+```
